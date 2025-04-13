@@ -15,7 +15,10 @@ struct Connection {
     addr: SocketAddr,
     packet_sequencer: PacketSequencer,
 
-    name: String,
+    player_id: PlayerId,
+    last_packet_time: Tick,
+
+    connected: bool,
 }
 
 impl Connection {
@@ -23,186 +26,20 @@ impl Connection {
         Self {
             addr,
             packet_sequencer: PacketSequencer::new(),
-            name: String::new(),
+            player_id: INVALID_PLAYER_ID,
+            last_packet_time: Tick::now(),
+            connected: true,
         }
     }
 
-    fn handle_packet(&mut self, game_socket: &mut UdpSocket, message: &[u8]) {
-        if message.len() < 1 {
-            return;
-        }
-
-        let size = message.len();
-        let pkt_type = message[0];
-
-        if pkt_type == 0 {
-            if size <= 2 {
-                return;
-            }
-
-            let pkt_type = message[1];
-
-            match pkt_type {
-                1 => {}
-                2 => {}
-                3 => {
-                    if let Err(e) = self.handle_reliable_message(game_socket, message) {
-                        println!("Error handling reliable message: {}", e);
-                    }
-                }
-                4 => {
-                    if size < 6 {
-                        return;
-                    }
-
-                    let id: u32 = u32::from_le_bytes(message[2..6].try_into().unwrap());
-                    self.packet_sequencer.handle_ack(id);
-                }
-                5 => {
-                    // Sync request
-                    if size < 6 {
-                        return;
-                    }
-
-                    let recv_timestamp = u32::from_le_bytes(message[2..6].try_into().unwrap());
-                    let sync_response_packet = Packet::new_sync_response(Tick::new(recv_timestamp));
-
-                    if let Err(e) = self.send(game_socket, sync_response_packet) {
-                        println!("Error sending sync response: {}", e);
-                    }
-                }
-                14 => {
-                    // Cluster
-                    let mut cluster = &message[2..];
-
-                    while !cluster.is_empty() {
-                        let subsize: usize = cluster[0] as usize;
-
-                        if cluster.len() >= subsize + 1 {
-                            let subpkt = &cluster[1..subsize + 1];
-
-                            self.handle_packet(game_socket, &subpkt);
-                        } else {
-                            break;
-                        }
-
-                        cluster = &cluster[subsize + 1..];
-                    }
-                }
-                _ => {
-                    return;
-                }
-            }
-        } else {
-            match pkt_type {
-                1 => {
-                    // ArenaLogin
-                    let mut pid_pkt = [0; 3];
-                    let pid: u16 = 0;
-
-                    pid_pkt[0] = 0x01;
-                    pid_pkt[1..3].copy_from_slice(&pid.to_le_bytes());
-                    self.send_reliable_message(game_socket, &pid_pkt);
-
-                    self.send_small_chunked_message(game_socket, &ARENA_SETTINGS);
-
-                    let mut map_info_pkt = [0; 25];
-                    let map_name = "pub.lvl";
-                    let map_checksum: u32 = 1889723958;
-                    let map_filesize: u32 = 58992;
-
-                    map_info_pkt[0] = 0x29;
-                    map_info_pkt[1..map_name.len() + 1].copy_from_slice(map_name.as_bytes());
-                    map_info_pkt[17..21].copy_from_slice(&map_checksum.to_le_bytes());
-                    map_info_pkt[21..25].copy_from_slice(&map_filesize.to_le_bytes());
-
-                    self.send_reliable_message(game_socket, &map_info_pkt);
-
-                    let mut enter_pkt = [0; 64];
-                    enter_pkt[0] = 0x03;
-                    enter_pkt[1] = 0x08;
-                    enter_pkt[2] = 0x00;
-                    enter_pkt[3..self.name.len() + 3].copy_from_slice(self.name.as_bytes());
-                    enter_pkt[51..53].copy_from_slice(&pid.to_le_bytes());
-
-                    self.send_reliable_message(game_socket, &enter_pkt[..]);
-
-                    let mut data = [0; 1];
-                    data[0] = 0x02;
-                    self.send_reliable_message(game_socket, &data);
-                }
-                36 => {
-                    // Password
-                    if size < 66 {
-                        return;
-                    }
-
-                    let name = std::str::from_utf8(&message[2..34]).unwrap();
-                    let _ = std::str::from_utf8(&message[34..66]).unwrap(); // Password
-
-                    self.name = name.into();
-                    println!("Name: {}", name);
-
-                    // Send version packet
-                    let mut data = [0; MAX_PACKET_SIZE];
-
-                    let checksum: u32 = 0xC9B61486;
-
-                    data[0] = 0x34;
-                    data[1] = 40;
-                    data[2] = 0x00;
-                    data[3..7].copy_from_slice(&checksum.to_le_bytes());
-
-                    let version_pkt = &data[..7];
-                    self.send_reliable_message(game_socket, &version_pkt);
-
-                    let server_version: u32 = 134;
-                    let subspace_checksum: u32 = 0;
-
-                    data[0] = 0x0A;
-                    data[1] = 0x00;
-                    data[2..6].copy_from_slice(&server_version.to_le_bytes());
-                    data[10..14].copy_from_slice(&subspace_checksum.to_le_bytes());
-
-                    let password_response_pkt = &data[..36];
-                    self.send_reliable_message(game_socket, &password_response_pkt);
-                }
-                _ => {
-                    return;
-                }
-            }
-        }
-    }
-
-    fn handle_reliable_message(
-        &mut self,
-        game_socket: &mut UdpSocket,
-        message: &[u8],
-    ) -> std::io::Result<()> {
-        if message.len() < 7 {
-            return Ok(());
-        }
-
-        let reliable_id: u32 = u32::from_le_bytes(message[2..6].try_into().unwrap());
-        let ack_pkt = Packet::new_reliable_ack(reliable_id);
-
-        self.send(game_socket, ack_pkt)?;
-
-        self.packet_sequencer
-            .reliable_queue
-            .push(ReliableMessage::new(reliable_id, &message[6..]));
-
-        Ok(())
-    }
-
-    fn send(&mut self, game_socket: &mut UdpSocket, packet: Packet) -> std::io::Result<()> {
+    fn send(&mut self, game_socket: &UdpSocket, packet: Packet) -> std::io::Result<()> {
         let buf = &packet.data[..packet.size];
         println!("Sending: {:?}", buf);
         game_socket.send_to(buf, &self.addr)?;
         Ok(())
     }
 
-    fn send_reliable_message(&mut self, game_socket: &mut UdpSocket, message: &[u8]) -> bool {
+    fn send_reliable_message(&mut self, game_socket: &UdpSocket, message: &[u8]) -> bool {
         let size = message.len() + 6;
         if size > MAX_PACKET_SIZE {
             return false;
@@ -222,7 +59,7 @@ impl Connection {
         return true;
     }
 
-    fn send_small_chunked_message(&mut self, game_socket: &mut UdpSocket, message: &[u8]) {
+    fn send_small_chunked_message(&mut self, game_socket: &UdpSocket, message: &[u8]) {
         // Header size includes reliable message header and small chunk header size
         const HEADER_SIZE: usize = 2 + 6;
 
@@ -249,6 +86,327 @@ impl Connection {
             current = &current[size..];
         }
     }
+
+    fn send_disconnect(&mut self, game_socket: &UdpSocket) {
+        let packet = Packet::empty().concat_u8(0x00).concat_u8(0x07);
+
+        if let Err(e) = self.send(game_socket, packet) {
+            println!("Failed to send disconnect packet: {}", e);
+        }
+
+        self.connected = false;
+    }
+
+    fn send_enter_list(&mut self, player_manager: &PlayerManager, game_socket: &UdpSocket) {
+        const ENTER_PACKET_SIZE: usize = 64;
+
+        let mut packet = Packet::empty();
+
+        for (id, player) in &player_manager.players {
+            if packet.remaining() < ENTER_PACKET_SIZE {
+                self.send_reliable_message(game_socket, &packet.data[..packet.size]);
+
+                packet = Packet::empty();
+            }
+
+            let mut name_len = player.name.len();
+            if name_len > 20 {
+                name_len = 20;
+            }
+
+            let slice = &mut packet.data[packet.size..packet.size + ENTER_PACKET_SIZE];
+
+            slice[0] = 0x03;
+            slice[1] = 0x08;
+            slice[3..name_len + 3].copy_from_slice(&player.name.as_bytes()[..name_len]);
+            slice[51..53].copy_from_slice(&id.to_le_bytes());
+            packet.size += ENTER_PACKET_SIZE;
+        }
+
+        if packet.size > 0 {
+            self.send_reliable_message(game_socket, &packet.data[..packet.size]);
+        }
+    }
+}
+
+// TODO: Arenas
+struct Game {
+    player_manager: PlayerManager,
+}
+
+impl Game {
+    fn new() -> Self {
+        Self {
+            player_manager: PlayerManager::new(),
+        }
+    }
+
+    fn on_data(
+        &mut self,
+        game_socket: &UdpSocket,
+        connections: &mut HashMap<SocketAddr, Connection>,
+        addr: SocketAddr,
+        packet: Packet,
+    ) -> bool {
+        self.handle_packet(game_socket, connections, addr, packet);
+
+        if let Some(conn) = connections.get_mut(&addr) {
+            if let Some(rel_mesg) = conn.packet_sequencer.pop_process_queue() {
+                let data = &rel_mesg.message[..rel_mesg.size];
+
+                return self.handle_packet(game_socket, connections, addr, Packet::new(data));
+            } else {
+                return conn.connected;
+            }
+        }
+
+        false
+    }
+
+    fn handle_packet(
+        &mut self,
+        game_socket: &UdpSocket,
+        connections: &mut HashMap<SocketAddr, Connection>,
+        addr: SocketAddr,
+        packet: Packet,
+    ) -> bool {
+        let buf = &packet.data[..packet.size];
+        let packet_type = buf[0];
+
+        if packet_type == 0x00 {
+            if packet.size < 2 {
+                return false;
+            }
+
+            let packet_type = buf[1];
+
+            match packet_type {
+                3 => {
+                    // Reliable message
+                    if buf.len() < 7 {
+                        if let Some(conn) = connections.get_mut(&addr) {
+                            conn.send_disconnect(game_socket);
+                        }
+                        return false;
+                    }
+
+                    let reliable_id: u32 = u32::from_le_bytes(buf[2..6].try_into().unwrap());
+                    let ack_pkt = Packet::new_reliable_ack(reliable_id);
+
+                    if let Some(conn) = connections.get_mut(&addr) {
+                        if let Err(e) = conn.send(game_socket, ack_pkt) {
+                            println!("Failed to send reliable ack: {}", e);
+                            conn.send_disconnect(game_socket);
+                        }
+
+                        conn.packet_sequencer
+                            .reliable_queue
+                            .push(ReliableMessage::new(reliable_id, &buf[6..]));
+                    }
+                }
+                4 => {
+                    // Reliable message ack
+                    if buf.len() < 6 {
+                        if let Some(conn) = connections.get_mut(&addr) {
+                            conn.send_disconnect(game_socket);
+                        }
+                    }
+
+                    let id: u32 = u32::from_le_bytes(buf[2..6].try_into().unwrap());
+
+                    if let Some(conn) = connections.get_mut(&addr) {
+                        conn.packet_sequencer.handle_ack(id);
+                    }
+                }
+
+                5 => {
+                    // Sync request
+                    if buf.len() < 6 {
+                        return false;
+                    }
+
+                    let recv_timestamp = u32::from_le_bytes(buf[2..6].try_into().unwrap());
+                    let sync_response_packet = Packet::new_sync_response(Tick::new(recv_timestamp));
+
+                    if let Some(conn) = connections.get_mut(&addr) {
+                        if let Err(e) = conn.send(game_socket, sync_response_packet) {
+                            println!("Error sending sync response: {}", e);
+                        }
+                    }
+                }
+                7 => {
+                    if let Some(conn) = connections.get_mut(&addr) {
+                        conn.connected = false;
+                        println!("Received disconnect packet");
+                    }
+                }
+                14 => {
+                    // Cluster
+                    let mut cluster = &buf[2..];
+
+                    while !cluster.is_empty() {
+                        let subsize: usize = cluster[0] as usize;
+
+                        if cluster.len() >= subsize + 1 {
+                            let subpkt = &cluster[1..subsize + 1];
+
+                            self.handle_packet(
+                                game_socket,
+                                connections,
+                                addr,
+                                Packet::new(&subpkt),
+                            );
+                        } else {
+                            break;
+                        }
+
+                        cluster = &cluster[subsize + 1..];
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            match packet_type {
+                1 => {
+                    // ArenaLogin
+                    let Some(conn) = connections.get_mut(&addr) else {
+                        return false;
+                    };
+
+                    let Some(player) = self.player_manager.get_player_by_id(conn.player_id) else {
+                        conn.send_disconnect(game_socket);
+                        return false;
+                    };
+
+                    let mut pid_pkt = [0; 3];
+                    let pid: u16 = player.id;
+
+                    pid_pkt[0] = 0x01;
+                    pid_pkt[1..3].copy_from_slice(&pid.to_le_bytes());
+                    conn.send_reliable_message(game_socket, &pid_pkt);
+
+                    conn.send_small_chunked_message(game_socket, &ARENA_SETTINGS);
+
+                    let mut map_info_pkt = [0; 25];
+                    let map_name = "pub.lvl";
+                    let map_checksum: u32 = 1889723958;
+                    let map_filesize: u32 = 58992;
+
+                    map_info_pkt[0] = 0x29;
+                    map_info_pkt[1..map_name.len() + 1].copy_from_slice(map_name.as_bytes());
+                    map_info_pkt[17..21].copy_from_slice(&map_checksum.to_le_bytes());
+                    map_info_pkt[21..25].copy_from_slice(&map_filesize.to_le_bytes());
+
+                    conn.send_reliable_message(game_socket, &map_info_pkt);
+
+                    conn.send_enter_list(&self.player_manager, game_socket);
+
+                    let mut data = [0; 1];
+                    data[0] = 0x02;
+                    conn.send_reliable_message(game_socket, &data);
+                    self.broadcast_player_enter(game_socket, pid);
+                }
+                36 => {
+                    // Password
+                    let Some(conn) = connections.get_mut(&addr) else {
+                        return false;
+                    };
+                    if buf.len() < 66 {
+                        conn.send_disconnect(game_socket);
+                        return false;
+                    }
+
+                    let name = std::str::from_utf8(&buf[2..34]).unwrap();
+                    let _ = std::str::from_utf8(&buf[34..66]).unwrap(); // Password
+
+                    println!("Name: {}", name);
+
+                    if let Some(player) = self.player_manager.create_player(addr) {
+                        player.name = name.into();
+
+                        conn.player_id = player.id;
+                    } else {
+                        println!("Failed to create player for: {:?}", name);
+                        conn.send_disconnect(game_socket);
+                        return false;
+                    }
+
+                    // Send version packet
+                    let mut data = [0; MAX_PACKET_SIZE];
+
+                    let checksum: u32 = 0xC9B61486;
+
+                    data[0] = 0x34;
+                    data[1] = 40;
+                    data[2] = 0x00;
+                    data[3..7].copy_from_slice(&checksum.to_le_bytes());
+
+                    let version_pkt = &data[..7];
+                    conn.send_reliable_message(game_socket, &version_pkt);
+
+                    let server_version: u32 = 134;
+                    let subspace_checksum: u32 = 0;
+
+                    data[0] = 0x0A;
+                    data[1] = 0x00;
+                    data[2..6].copy_from_slice(&server_version.to_le_bytes());
+                    data[10..14].copy_from_slice(&subspace_checksum.to_le_bytes());
+
+                    let password_response_pkt = &data[..36];
+                    conn.send_reliable_message(game_socket, &password_response_pkt);
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(conn) = connections.get(&addr) {
+            return conn.connected;
+        }
+        return false;
+    }
+
+    fn broadcast_player_enter(&mut self, game_socket: &UdpSocket, player_id: PlayerId) {
+        const ENTER_PACKET_SIZE: usize = 64;
+        let mut packet = Packet::empty();
+
+        let Some(join_player) = self.player_manager.get_player_by_id(player_id) else {
+            return;
+        };
+
+        let mut name_len = join_player.name.len();
+        if name_len > 20 {
+            name_len = 20;
+        }
+
+        packet.data[0] = 0x03;
+        packet.data[1] = 0x08;
+        packet.data[3..name_len + 3].copy_from_slice(&join_player.name.as_bytes()[..name_len]);
+        packet.data[51..53].copy_from_slice(&join_player.id.to_le_bytes());
+        packet.size = ENTER_PACKET_SIZE;
+
+        for (id, player) in self.player_manager.players.iter() {
+            if *id == player_id {
+                continue;
+            }
+
+            if let Err(e) = game_socket.send_to(&packet.data[..packet.size], player.addr) {
+                println!("Error sending player enter: {}", e);
+            }
+        }
+    }
+
+    fn broadcast_player_leave(&mut self, game_socket: &UdpSocket, player_id: PlayerId) {
+        self.player_manager.remove_player(player_id);
+
+        let packet = Packet::empty().concat_u8(0x04).concat_u16(player_id);
+
+        // TODO: Check arena and player in valid state to receive
+        for (_, player) in &self.player_manager.players {
+            if let Err(e) = game_socket.send_to(&packet.data[..packet.size], &player.addr) {
+                println!("Failed to send player leave: {}", e);
+            }
+        }
+    }
 }
 
 struct Server {
@@ -256,8 +414,7 @@ struct Server {
     game_socket: UdpSocket,
 
     connections: HashMap<SocketAddr, Connection>,
-
-    player_manager: PlayerManager,
+    game: Game,
 }
 
 impl Server {
@@ -272,11 +429,52 @@ impl Server {
             ping_socket,
             game_socket,
             connections: HashMap::new(),
-            player_manager: PlayerManager::new(),
+            game: Game::new(),
         })
     }
 
+    fn remove_connection(&mut self, addr: SocketAddr) {
+        let Some(player_id) = self
+            .connections
+            .get(&addr)
+            .and_then(|conn| Some(conn.player_id))
+        else {
+            return;
+        };
+
+        if let Some(conn) = self.connections.remove(&addr).as_mut() {
+            conn.send_disconnect(&mut self.game_socket);
+        }
+
+        self.game
+            .broadcast_player_leave(&self.game_socket, player_id);
+    }
+
+    fn timeout_connection(&mut self) {
+        const TIMEOUT_TICKS: i32 = 1000;
+        let mut remove_addr = None;
+
+        let now = Tick::now();
+
+        // Times out the first connection that hasn't sent data recently.
+        for (addr, connection) in &mut self.connections {
+            let ticks_since_data = now.diff(&connection.last_packet_time);
+
+            if ticks_since_data >= TIMEOUT_TICKS {
+                println!("Timing out {:?}", addr);
+                remove_addr = Some(addr.to_owned());
+                break;
+            }
+        }
+
+        if let Some(addr) = remove_addr {
+            self.remove_connection(addr);
+        }
+    }
+
     fn poll_game(&mut self) -> std::io::Result<()> {
+        self.timeout_connection();
+
         let mut buf = [0; MAX_PACKET_SIZE];
         let (size, src) = match self.game_socket.recv_from(&mut buf) {
             Ok(r) => Ok((r.0, r.1)),
@@ -315,10 +513,17 @@ impl Server {
 
         println!("Recv: {:?}", buf);
 
-        connection.handle_packet(&mut self.game_socket, buf);
+        connection.last_packet_time = Tick::now();
 
-        while let Some(rel_mesg) = connection.packet_sequencer.pop_process_queue() {
-            connection.handle_packet(&mut self.game_socket, &rel_mesg.message);
+        let addr = connection.addr.clone();
+
+        if !self.game.on_data(
+            &self.game_socket,
+            &mut self.connections,
+            addr,
+            Packet::new(buf),
+        ) {
+            self.remove_connection(addr);
         }
 
         Ok(())

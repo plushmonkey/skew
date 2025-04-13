@@ -1,9 +1,11 @@
 use crate::clock::Tick;
+use std::fmt;
 
 pub mod sequencer;
 
 pub const MAX_PACKET_SIZE: usize = 520;
 
+#[derive(Copy, Clone)]
 pub struct Packet {
     pub data: [u8; MAX_PACKET_SIZE],
     pub size: usize,
@@ -63,6 +65,66 @@ impl Packet {
         Self { data, size }
     }
 
+    pub fn concat_u8(self, val: u8) -> Self {
+        let mut result = Self {
+            data: self.data,
+            size: self.size + 1,
+        };
+
+        result.data[self.size] = val;
+
+        result
+    }
+
+    pub fn concat_u16(self, val: u16) -> Self {
+        let mut result = Self {
+            data: self.data,
+            size: self.size + 2,
+        };
+
+        result.data[self.size..self.size + 2].copy_from_slice(&val.to_le_bytes());
+        result
+    }
+
+    pub fn concat_u32(self, val: u32) -> Self {
+        let mut result = Self {
+            data: self.data,
+            size: self.size + 4,
+        };
+        result.data[self.size..self.size + 4].copy_from_slice(&val.to_le_bytes());
+        result
+    }
+
+    pub fn concat_i8(self, val: i8) -> Self {
+        let mut result = Self {
+            data: self.data,
+            size: self.size + 1,
+        };
+
+        result.data[self.size] = val as u8;
+
+        result
+    }
+
+    pub fn concat_i16(self, val: i16) -> Self {
+        let mut result = Self {
+            data: self.data,
+            size: self.size + 2,
+        };
+
+        result.data[self.size..self.size + 2].copy_from_slice(&val.to_le_bytes());
+        result
+    }
+
+    pub fn concat_i32(self, val: i32) -> Self {
+        let mut result = Self {
+            data: self.data,
+            size: self.size + 4,
+        };
+        result.data[self.size..self.size + 4].copy_from_slice(&val.to_le_bytes());
+        result
+    }
+
     pub fn write_u8(&mut self, val: u8) {
         self.data[self.size] = val;
         self.size += 1;
@@ -91,5 +153,20 @@ impl Packet {
     pub fn write_i32(&mut self, val: i32) {
         self.data[self.size..self.size + 4].copy_from_slice(&val.to_le_bytes());
         self.size += 4;
+    }
+
+    pub fn remaining(&self) -> usize {
+        MAX_PACKET_SIZE - self.size
+    }
+}
+
+impl fmt::Debug for Packet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Packet {{ data={:?} size={} }}",
+            &self.data[..self.size],
+            self.size
+        )
     }
 }
